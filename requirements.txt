@@ -1,0 +1,6 @@
+# Librairies ajoutées à l'image Airflow 2.11.2 (Python 3.11)
+# Versions testées ensemble : Spark + Great Expectations + MLflow + Evidently
+pyspark==3.5.8
+mlflow-skinny==3.17.0
+great-expectations==1.24.0
+evidently==0.7.23

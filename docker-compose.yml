@@ -1,0 +1,166 @@
+# TaxiFlow — stack légère pour un PC de 8 Go
+# Services : PostgreSQL (métadonnées Airflow) + MLflow + Airflow (webserver et scheduler dans un seul conteneur)
+#            + Dashboard Streamlit (lecture des rapports du pipeline)
+#            + Data Lineage : Marquez (API + base + interface), démarré seulement avec le profil "lineage" :
+#              docker compose --profile lineage up -d
+
+x-airflow-env: &airflow-env
+  # --- Airflow ---
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__PARALLELISM: "2"            # 2 tâches max en même temps
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "1" # une seule tâche Spark à la fois (économie de RAM)
+  AIRFLOW__WEBSERVER__WORKERS: "1"           # 1 seul worker web au lieu de 4
+  AIRFLOW__WEBSERVER__SECRET_KEY: taxiflow-dev-secret
+  # --- Projet ---
+  PYTHONPATH: /opt/airflow/src
+  DATA_DIR: /opt/airflow/data
+  REPORTS_DIR: /opt/airflow/reports
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  SPARK_DRIVER_MEMORY: 1g
+  TRAIN_SAMPLE_FRACTION: "0.15"     # entraînement sur 15 % de Silver (évite le crash mémoire sur 8 Go)
+  MIN_IMPROVEMENT_MINUTES: "0.05"   # le nouveau modèle doit gagner au moins 3 s de MAE pour remplacer le champion
+  # --- Désactiver la télémétrie des librairies ---
+  MLFLOW_DISABLE_TELEMETRY: "true"
+  MLFLOW_DISABLE_AGENT_HINT: "1"
+  GX_ANALYTICS_ENABLED: "false"
+  DO_NOT_TRACK: "true"
+  # --- Data Lineage : chaque tâche envoie ce qu'elle lit et écrit à Marquez (OpenLineage) ---
+  # Si Marquez n'est pas démarré, l'envoi échoue en silence : le pipeline n'est jamais bloqué.
+  AIRFLOW__OPENLINEAGE__NAMESPACE: taxiflow
+  AIRFLOW__OPENLINEAGE__TRANSPORT: '{"type": "http", "url": "http://marquez-api:5000", "endpoint": "api/v1/lineage", "timeout": 5, "retry": {"total": 1, "backoff_factor": 0.5}}'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped
+
+  mlflow:
+    build: ./mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --host 0.0.0.0 --port 5000 --workers 1
+      --allowed-hosts "mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    restart: unless-stopped
+
+  airflow:
+    build: .
+    user: "50000:0"
+    environment: *airflow-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - ./reports:/opt/airflow/reports
+    # Initialise la base, crée l'utilisateur admin/admin, lance le scheduler en arrière-plan puis le webserver
+    command:
+      - bash
+      - -c
+      - >-
+        rm -f /opt/airflow/airflow-webserver.pid &&
+        airflow db migrate &&
+        (airflow users create --username admin --password admin --firstname Salma --lastname Admin --role Admin --email admin@taxiflow.local || true) &&
+        (airflow scheduler &) &&
+        exec airflow webserver
+    restart: unless-stopped
+
+  # Dashboard Streamlit : lit les rapports JSON écrits par les tâches du DAG -> http://localhost:8501
+  # (construit sur l'image Airflow déjà présente : seuls Streamlit et Plotly sont téléchargés)
+  dashboard:
+    build: ./dashboard
+    image: taxiflow-dashboard
+    depends_on:
+      - airflow
+    environment:
+      REPORTS_DIR: /app/reports
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./reports:/app/reports:ro
+      - ./dashboard/app.py:/app/app.py:ro
+      - ./dashboard/.streamlit:/app/.streamlit:ro
+    mem_limit: 400m
+    restart: unless-stopped
+
+  # ---------- Data Lineage (OpenLineage + Marquez) ----------
+  # Démarrés seulement avec : docker compose --profile lineage up -d
+  marquez-db:
+    image: postgres:14-alpine
+    profiles: ["lineage"]
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    volumes:
+      - marquez-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "marquez"]
+      interval: 10s
+      retries: 5
+    mem_limit: 200m
+    restart: unless-stopped
+
+  # API Marquez : reçoit les événements OpenLineage envoyés par Airflow
+  marquez-api:
+    image: marquezproject/marquez:0.51.1
+    profiles: ["lineage"]
+    environment:
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+      POSTGRES_HOST: marquez-db
+      POSTGRES_PORT: 5432
+      SEARCH_ENABLED: "false"          # pas d'OpenSearch : trop lourd pour 8 Go
+      JAVA_OPTS: "-Xms128m -Xmx256m"   # mémoire Java limitée
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    ports:
+      - "5002:5000"   # 5000 est déjà pris par MLflow sur le PC
+    mem_limit: 500m
+    restart: unless-stopped
+
+  # Interface web Marquez : le graphe de traçabilité -> http://localhost:3000
+  marquez-web:
+    image: marquezproject/marquez-web:0.51.1
+    profiles: ["lineage"]
+    environment:
+      MARQUEZ_HOST: marquez-api
+      MARQUEZ_PORT: 5000
+      WEB_PORT: 3000
+    depends_on:
+      - marquez-api
+    ports:
+      - "3000:3000"
+    mem_limit: 250m
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mlflow-data:
+  marquez-data:

@@ -1,0 +1,17 @@
+# Data lake & pipeline outputs (recreated by the pipeline)
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
+logs/
+mlruns/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local / temporary files
+*.part
+.env
